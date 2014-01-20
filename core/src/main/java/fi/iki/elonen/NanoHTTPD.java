@@ -2,6 +2,7 @@ package fi.iki.elonen;
 
 import java.io.BufferedReader;
 import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.Closeable;
 import java.io.File;
 import java.io.FileInputStream;
@@ -813,6 +814,12 @@ public abstract class NanoHTTPD {
          * @arg files - map to modify
          */
         void parseBody(Map<String, String> files) throws IOException, ResponseException;
+        
+        /**
+         * Adds the files in the request body to the files map (in memory).
+         * @arg files - map to modify
+         */
+        void parseBodyInMemory(Map<String, String> files) throws IOException, ResponseException;
     }
 
     protected class HTTPSession implements IHTTPSession {
@@ -935,7 +942,7 @@ public abstract class NanoHTTPD {
         }
 
         @Override
-        public void parseBody(Map<String, String> files) throws IOException, ResponseException {
+        public void parseBody(Map<String, String> files) throws IOException, ResponseException {        	
             RandomAccessFile randomAccessFile = null;
             BufferedReader in = null;
             try {
@@ -1014,6 +1021,90 @@ public abstract class NanoHTTPD {
                 }
             } finally {
                 safeClose(randomAccessFile);
+                safeClose(in);
+            }
+        }
+        
+        @Override
+        public void parseBodyInMemory(Map<String, String> files) throws IOException, ResponseException {
+            ByteArrayOutputStream outputBuffer = null;
+            BufferedReader in = null;
+            try {
+
+                outputBuffer = new ByteArrayOutputStream();
+
+                long size;
+                if (headers.containsKey("content-length")) {
+                    size = Integer.parseInt(headers.get("content-length"));
+                } else if (splitbyte < rlen) {
+                    size = rlen - splitbyte;
+                } else {
+                    size = 0;
+                }
+
+                // Now read all the body and write it to f
+                byte[] buf = new byte[512];
+                while (rlen >= 0 && size > 0) {
+                    rlen = inputStream.read(buf, 0, 512);
+                    size -= rlen;
+                    if (rlen > 0) {
+                        outputBuffer.write(buf, 0, rlen);
+                    }
+                }
+
+                // Get the raw body as a byte []
+                byte[] data = outputBuffer.toByteArray();
+                ByteBuffer fbuf = ByteBuffer.wrap(data);
+
+                // Create a BufferedReader for easily reading it as string.
+                InputStream bin = new ByteArrayInputStream(data);
+                in = new BufferedReader(new InputStreamReader(bin));
+
+                // If the method is POST, there may be parameters
+                // in data section, too, read it:
+                if (Method.POST.equals(method)) {
+                    String contentType = "";
+                    String contentTypeHeader = headers.get("content-type");
+
+                    StringTokenizer st = null;
+                    if (contentTypeHeader != null) {
+                        st = new StringTokenizer(contentTypeHeader, ",; ");
+                        if (st.hasMoreTokens()) {
+                            contentType = st.nextToken();
+                        }
+                    }
+
+                    if ("multipart/form-data".equalsIgnoreCase(contentType)) {
+                        // Handle multipart/form-data
+                        if (!st.hasMoreTokens()) {
+                            throw new ResponseException(Response.Status.BAD_REQUEST, "BAD REQUEST: Content type is multipart/form-data but boundary missing. Usage: GET /example/file.html");
+                        }
+
+                        String boundaryStartString = "boundary=";
+                        int boundaryContentStart = contentTypeHeader.indexOf(boundaryStartString) + boundaryStartString.length();
+                        String boundary = contentTypeHeader.substring(boundaryContentStart, contentTypeHeader.length());
+                        if (boundary.startsWith("\"") && boundary.endsWith("\"")) {
+                            boundary = boundary.substring(1, boundary.length() - 1);
+                        }
+
+                        decodeMultipartData(boundary, fbuf, in, parms, files);
+                    } else {
+                        // Handle application/x-www-form-urlencoded
+                        String postLine = "";
+                        char pbuf[] = new char[512];
+                        int read = in.read(pbuf);
+                        while (read >= 0 && !postLine.endsWith("\r\n")) {
+                            postLine += String.valueOf(pbuf, 0, read);
+                            read = in.read(pbuf);
+                        }
+                        postLine = postLine.trim();
+                        decodeParms(postLine, parms);
+                    }
+                } else if (Method.PUT.equals(method)) {
+                    files.put("content", saveTmpFile(fbuf, 0, fbuf.limit()));
+                }
+            } finally {
+                safeClose(outputBuffer);
                 safeClose(in);
             }
         }
